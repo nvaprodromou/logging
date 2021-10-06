@@ -1,7 +1,7 @@
 import warnings
 import os
 
-from ..compliance_checker import mlp_parser
+from compliance_checker import mlp_parser
 
 # What are source files?
 SOURCE_FILE_EXT = {

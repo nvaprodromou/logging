@@ -9,14 +9,21 @@ import json
 import os
 import sys
 
-from ..compliance_checker import mlp_compliance
-from ..compliance_checker.mlp_compliance import usage_choices, rule_choices
-from ..rcp_checker import rcp_checker
-from .seed_checker import find_source_files_under, SeedChecker
-from ..system_desc_checker import system_desc_checker
+# from ..compliance_checker import mlp_compliance
+# from ..compliance_checker.mlp_compliance import usage_choices, rule_choices
+# from ..rcp_checker import rcp_checker
+# from .seed_checker import find_source_files_under, SeedChecker
+# from ..system_desc_checker import system_desc_checker
 
-from ..benchmark_meta import get_allowed_benchmarks, get_result_file_counts
+# from ..benchmark_meta import get_allowed_benchmarks, get_result_file_counts
 
+from compliance_checker import mlp_compliance
+from compliance_checker.mlp_compliance import usage_choices, rule_choices
+from rcp_checker import rcp_checker
+from seed_checker import find_source_files_under, SeedChecker
+from system_desc_checker import system_desc_checker
+
+from benchmark_meta import get_allowed_benchmarks, get_result_file_counts
 
 
 def _get_sub_folders(folder):

@@ -14,12 +14,12 @@ import sys
 import itertools
 import pandas as pd
 
-from ..compliance_checker import mlp_compliance
-from ..compliance_checker.mlp_compliance import usage_choices, rule_choices
-from ..compliance_checker.mlp_parser import parse_file
-from ..rcp_checker import rcp_checker
+from compliance_checker import mlp_compliance
+from compliance_checker.mlp_compliance import usage_choices, rule_choices
+from compliance_checker.mlp_parser import parse_file
+from rcp_checker import rcp_checker
 
-from ..benchmark_meta import get_allowed_benchmarks, get_result_file_counts
+from benchmark_meta import get_allowed_benchmarks, get_result_file_counts
 
 
 def _get_sub_folders(folder):
@@ -124,6 +124,27 @@ def _read_result_file(result_file, usage, ruleset):
 
     return loglines
 
+# AP: Adding stats
+
+def _query_convergence_epochs(loglines):
+    # algorithm: Finds the last "epoch_stop" in the log
+    # WARN: Not a bulletproof solution
+    convergence_epochs = 0
+    for logline in loglines[::-1]:  # Start loop from end for perf
+        if logline.key == 'epoch_stop':
+            convergence_epochs = logline.value['metadata']['epoch_num']
+            break
+    assert convergence_epochs > 0
+    return convergence_epochs
+
+def _query_global_batch_size(loglines):
+    gbs = 0
+    for logline in loglines:
+        if logline.key == 'global_batch_size':
+            gbs = logline.value['value']
+            break
+    assert gbs > 0
+    return gbs
 
 def _query_run_start_stop(loglines):
     run_start, run_stop = None, None
@@ -224,6 +245,17 @@ def _get_weak_scaling_metric_schema():
         'number_of_models': float,
         'instance_scale': float,
         'time_to_train_all': float,
+        'models_per_minute': float,
+        'RCP Compliance' : str
+    }
+
+
+def _get_strong_scaling_metric_schema():
+    return {
+        'GBS': float,
+        'epochs': float,
+        'score': float,
+        'RCP Compliance' : str
     }
 
 
@@ -244,15 +276,16 @@ def _get_column_schema(usage, ruleset, weak_scaling=False):
         'accelerators_count': int,
         'framework': str,
     }
+    benchmarks = get_allowed_benchmarks(usage, ruleset)
+    
     if weak_scaling == True:
-        benchmarks = get_allowed_benchmarks(usage, ruleset)
         for benchmark in benchmarks:
             for metric, dtype in _get_weak_scaling_metric_schema().items():
                 schema['{}:{}'.format(benchmark, metric)] = dtype
-    else:
-        schema.update(
-            {b: float
-             for b in get_allowed_benchmarks(usage, ruleset)})
+    if weak_scaling == False:
+        for benchmark in benchmarks:
+            for metric, dtype in _get_strong_scaling_metric_schema().items():
+                schema['{}:{}'.format(benchmark, metric)] = dtype
     schema.update({'details_url': str, 'code_url': str})
     return schema
 
@@ -287,6 +320,8 @@ def _compute_strong_scaling_scores(desc, system_folder, usage, ruleset):
         pattern = '{folder}/result_*.txt'.format(folder=benchmark_folder)
         result_files = glob.glob(pattern, recursive=True)
         scores = []
+        epochs = []
+        batches = []
         dropped_scores = 0
         for result_file in result_files:
             try:
@@ -296,6 +331,10 @@ def _compute_strong_scaling_scores(desc, system_folder, usage, ruleset):
                 print('{} in {}'.format(e, result_file))
                 dropped_scores += 1
                 continue
+            else:
+                epochs.append(_query_convergence_epochs(loglines))
+                batches.append(_query_global_batch_size(loglines))
+
         max_dropped_scores = 4 if benchmark == 'unet3d' else 1
         if dropped_scores > max_dropped_scores:
             print('CRITICAL ERROR: Too many non-converging runs '
@@ -311,8 +350,21 @@ def _compute_strong_scaling_scores(desc, system_folder, usage, ruleset):
                   ))
 
         if dropped_scores <= max_dropped_scores:
-            benchmark_scores[benchmark] = _compute_olympic_average(
-                scores, dropped_scores, max_dropped_scores)
+            olympic_score = _compute_olympic_average(scores, dropped_scores, max_dropped_scores)
+            olympic_epoch = _compute_olympic_average(epochs, dropped_scores, max_dropped_scores)
+            # make sure all result files show the same batch size
+            assert all(x==batches[0] for x in batches)
+
+            benchmark_scores['{}:{}'.format(benchmark, 'score',)] = olympic_score
+            benchmark_scores['{}:{}'.format(benchmark, 'epochs',)] = olympic_epoch
+            benchmark_scores['{}:{}'.format(benchmark, 'GBS',)] = batches[0]
+        
+        # AP: Fill in RCP Compliance
+        checker = rcp_checker.make_checker('hpc', '1.0.0')
+        checker._compute_rcp_stats()
+        test, msg = checker._check_directory(benchmark_folder)
+        pf = 'Pass' if test else 'Fail'
+        benchmark_scores['{}:{}'.format(benchmark, 'RCP Compliance',)] = '{}: {}'.format(pf, msg)
 
     _fill_empty_benchmark_scores(benchmark_scores, usage, ruleset)
     return benchmark_scores
@@ -349,7 +401,7 @@ def _compute_weak_scaling_scores(desc, system_folder, usage, ruleset):
         pattern = '{folder}/result_*.txt'.format(folder=benchmark_folder)
         result_files = glob.glob(pattern, recursive=True)
         global_start, global_stop = float('inf'), float('-inf')
-        number_of_models = 0
+        number_of_models = 0.0
         instance_scale = None
         for result_file in result_files:
             try:
@@ -379,6 +431,15 @@ def _compute_weak_scaling_scores(desc, system_folder, usage, ruleset):
                 benchmark,
                 'instance_scale',
             )] = instance_scale
+            benchmark_scores['{}:{}'.format( benchmark, 'models_per_minute', )] = benchmark_scores['{}:number_of_models'.format(
+                benchmark)] / benchmark_scores['{}:time_to_train_all'.format(benchmark)]
+
+            # AP: Fill in RCP Compliance
+            checker = rcp_checker.make_checker('hpc', '1.0.0')
+            checker._compute_rcp_stats()
+            test, msg = checker._check_directory(benchmark_folder)
+            pf = 'Pass' if test else 'Fail'
+            benchmark_scores['{}:{}'.format(benchmark, 'RCP Compliance',)] = '{}: {}'.format(pf, msg)
         else:
             print('CRITICAL ERROR: Not enough converging weak scaling runs '
                   'for {} {}/{}'.format(desc['submitter'], system, benchmark))
@@ -405,15 +466,11 @@ def _fill_empty_benchmark_scores(
     weak_scaling=False,
 ):
     for benchmark in get_allowed_benchmarks(usage, ruleset):
-        if weak_scaling:
-            for metric in _get_weak_scaling_metric_schema().keys():
-                k = '{}:{}'.format(benchmark, metric)
-                if k not in benchmark_scores:
-                    benchmark_scores[k] = None
-
-        else:
-            if benchmark not in benchmark_scores:
-                benchmark_scores[benchmark] = None
+        metric_schema = _get_weak_scaling_metric_schema() if weak_scaling else _get_strong_scaling_metric_schema()
+        for metric in metric_schema.keys():
+            k = '{}:{}'.format(benchmark, metric)
+            if k not in benchmark_scores:
+                benchmark_scores[k] = None
 
 
 def summarize_results(folder, usage, ruleset, csv_file=None):

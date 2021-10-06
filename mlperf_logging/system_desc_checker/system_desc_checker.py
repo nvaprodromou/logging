@@ -8,7 +8,7 @@ import argparse
 import json
 import sys
 
-from ..compliance_checker.mlp_compliance import usage_choices, rule_choices
+from compliance_checker.mlp_compliance import usage_choices, rule_choices
 
 def _get_or_default(json, field, default):
     if field in json:
