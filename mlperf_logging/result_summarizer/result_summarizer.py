@@ -126,6 +126,52 @@ def _read_result_file(result_file, usage, ruleset):
 
 # AP: Adding stats
 
+
+hparams_set = [
+        'scaling',
+        'common:global_batch_size',
+        'common:opt_name',
+        'cosmoflow:sgd_opt_momentum',
+        'cosmoflow:opt_base_learning_rate',
+        'cosmoflow:opt_learning_rate_warmup_epochs',
+        'cosmoflow:opt_learning_rate_warmup_factor',
+        'cosmoflow:opt_learning_rate_decay_boundary_epochs',
+        'cosmoflow:opt_learning_rate_decay_factor',
+        'cosmoflow:dropout',
+        'cosmoflow:opt_weight_decay',
+        'deepcam:batchnorm_group_size',
+        'deepcam:opt_eps',
+        'deepcam:opt_betas',
+        'deepcam:opt_weight_decay',
+        'deepcam:opt_lr',
+        'deepcam:scheduler_lr_warmup_steps',
+        'deepcam:scheduler_lr_warmup_factor',
+        'deepcam:scheduler_type',
+        'deepcam:scheduler_milestones',
+        'deepcam:scheduler_decay_rate',
+        'deepcam:scheduler_t_max',
+        'deepcam:scheduler_eta_min',
+        'deepcam:gradient_accumulation_frequency',
+        'oc20:opt_base_learning_rate',
+        'oc20:opt_learning_rate_warmup_factor',
+        'oc20:opt_learning_rate_decay_boundary_steps',
+    ]
+
+def _query_hparams(benchmark, loglines):
+    results = {x: None for x in hparams_set}
+    for logline in loglines:
+        if logline.key == 'run_start':
+            # all hparams are before this key
+            return results
+        if logline.key == 'global_batch_size' or logline.key == 'opt_name':
+            full_term = 'common:{}'.format(logline.key)
+        else:
+            full_term = '{}:{}'.format(benchmark, logline.key)
+        if full_term in results:
+            results[full_term] = logline.value['value']
+    raise ValueError
+
+
 def _query_convergence_epochs(loglines):
     # algorithm: Finds the last "epoch_stop" in the log
     # WARN: Not a bulletproof solution
@@ -264,7 +310,7 @@ def _get_empty_summary(usage, ruleset, weak_scaling=False):
         _get_column_schema(usage, ruleset, weak_scaling=weak_scaling).keys())
 
 
-def _get_column_schema(usage, ruleset, weak_scaling=False):
+def _get_column_schema(usage, ruleset, weak_scaling=False, is_hparams=False):
     schema = {
         'division': str,
         'availability': str,
@@ -278,6 +324,18 @@ def _get_column_schema(usage, ruleset, weak_scaling=False):
     }
     benchmarks = get_allowed_benchmarks(usage, ruleset)
     
+    if is_hparams:
+        for x in hparams_set:
+            schema[x] = float
+        schema['common:opt_name'] = str
+        schema['deepcam:scheduler_type'] = str
+        schema['scaling'] = str
+        schema['deepcam:opt_betas'] = object
+        schema['deepcam:scheduler_milestones'] = object
+        schema['cosmoflow:opt_learning_rate_decay_boundary_epochs'] = object
+        schema['cosmoflow:opt_learning_rate_decay_factor'] = object
+        return schema
+
     if weak_scaling == True:
         for benchmark in benchmarks:
             for metric, dtype in _get_weak_scaling_metric_schema().items():
@@ -311,7 +369,7 @@ def _compute_strong_scaling_scores(desc, system_folder, usage, ruleset):
     benchmark_folder_parent = os.path.join(
         system_folder, 'strong') if usage == 'hpc' else system_folder
     if not os.path.isdir(benchmark_folder_parent):
-        return benchmark_scores
+        return benchmark_scores, None
     for benchmark_folder in _get_sub_folders(benchmark_folder_parent):
         folder_parts = benchmark_folder.split('/')
         benchmark = _benchmark_alias(folder_parts[-1])
@@ -322,6 +380,8 @@ def _compute_strong_scaling_scores(desc, system_folder, usage, ruleset):
         scores = []
         epochs = []
         batches = []
+        all_hparams = {x:None for x in hparams_set}
+        first_result = True
         dropped_scores = 0
         for result_file in result_files:
             try:
@@ -334,7 +394,16 @@ def _compute_strong_scaling_scores(desc, system_folder, usage, ruleset):
             else:
                 epochs.append(_query_convergence_epochs(loglines))
                 batches.append(_query_global_batch_size(loglines))
+                hparams = _query_hparams(benchmark, loglines)
+                for k, v in hparams.items():
+                    if first_result:
+                        all_hparams[k] = v
+                    else:
+                        assert all_hparams[k] == v
+            if first_result:
+                first_result = False
 
+        all_hparams['scaling'] = 'STRONG'
         max_dropped_scores = 4 if benchmark == 'unet3d' else 1
         if dropped_scores > max_dropped_scores:
             print('CRITICAL ERROR: Too many non-converging runs '
@@ -367,7 +436,7 @@ def _compute_strong_scaling_scores(desc, system_folder, usage, ruleset):
         benchmark_scores['{}:{}'.format(benchmark, 'RCP Compliance',)] = '{}: {}'.format(pf, msg)
 
     _fill_empty_benchmark_scores(benchmark_scores, usage, ruleset)
-    return benchmark_scores
+    return benchmark_scores, all_hparams
 
 
 def _compute_weak_scaling_scores(desc, system_folder, usage, ruleset):
@@ -392,7 +461,7 @@ def _compute_weak_scaling_scores(desc, system_folder, usage, ruleset):
     benchmark_scores = {}
     benchmark_folder_parent = os.path.join(system_folder, 'weak')
     if not os.path.isdir(benchmark_folder_parent):
-        return benchmark_scores
+        return benchmark_scores, None
     for benchmark_folder in _get_sub_folders(benchmark_folder_parent):
         folder_parts = benchmark_folder.split('/')
         benchmark = _benchmark_alias(folder_parts[-1])
@@ -403,6 +472,8 @@ def _compute_weak_scaling_scores(desc, system_folder, usage, ruleset):
         global_start, global_stop = float('inf'), float('-inf')
         number_of_models = 0.0
         instance_scale = None
+        all_hparams = {x: None for x in hparams_set}
+        first_result = True
         for result_file in result_files:
             try:
                 loglines = _read_result_file(result_file, usage, ruleset)
@@ -417,7 +488,17 @@ def _compute_weak_scaling_scores(desc, system_folder, usage, ruleset):
             except ValueError as e:
                 print('{} in {}'.format(e, result_file))
                 continue
+            else:
+                hparams = _query_hparams(benchmark, loglines)
+                for k, v in hparams.items():
+                    if first_result:
+                        all_hparams[k] = v
+                    else:
+                        assert all_hparams[k] == v
+            if first_result:
+                first_result = False
 
+        all_hparams['scaling'] = 'WEAK'
         if number_of_models >= get_result_file_counts(usage)[benchmark]:
             benchmark_scores['{}:{}'.format(
                 benchmark,
@@ -448,7 +529,7 @@ def _compute_weak_scaling_scores(desc, system_folder, usage, ruleset):
                                  usage,
                                  ruleset,
                                  weak_scaling=True)
-    return benchmark_scores
+    return benchmark_scores, all_hparams
 
 
 def _load_system_desc(folder, system):
@@ -486,6 +567,19 @@ def summarize_results(folder, usage, ruleset, csv_file=None):
     weak_scaling_summary = _get_empty_summary(usage,
                                               ruleset,
                                               weak_scaling=True)
+
+    added_to_hparams = [
+        'division',
+        'availability',
+        'submitter',
+        'system',
+        'host_processor_model_name',
+        'host_processors_count',
+        'accelerator_model_name',
+        'accelerators_count',
+        'framework',
+        ]
+    hparams = Summary(added_to_hparams + hparams_set)
 
     for system_folder in _get_sub_folders(results_folder):
         folder_parts = system_folder.split('/')
@@ -544,10 +638,10 @@ def summarize_results(folder, usage, ruleset, csv_file=None):
             continue
 
         # Compute the scores.
-        strong_scaling_scores = _compute_strong_scaling_scores(
+        strong_scaling_scores, strong_hparams = _compute_strong_scaling_scores(
             desc, system_folder, usage, ruleset)
         if usage == 'hpc':
-            weak_scaling_scores = _compute_weak_scaling_scores(
+            weak_scaling_scores, weak_hparams = _compute_weak_scaling_scores(
                 desc, system_folder, usage, ruleset)
 
         # Construct postfix portion of the row.
@@ -563,6 +657,9 @@ def summarize_results(folder, usage, ruleset, csv_file=None):
                     urls.items(),
             ):
                 strong_scaling_summary.push(column_name, value)
+            for column_name, value in itertools.chain(system_specs.items(), strong_hparams.items()):
+                if column_name in hparams._column_names:
+                    hparams.push(column_name, value)
         if usage == 'hpc' and len(weak_scaling_scores) > 0:
             for column_name, value in itertools.chain(
                     system_specs.items(),
@@ -570,14 +667,19 @@ def summarize_results(folder, usage, ruleset, csv_file=None):
                     urls.items(),
             ):
                 weak_scaling_summary.push(column_name, value)
+            for column_name, value in itertools.chain(system_specs.items(), weak_hparams.items()):
+                if column_name in hparams._column_names:
+                    hparams.push(column_name, value)
 
     # Print rows in order of the sorted keys.
     strong_scaling_summary = strong_scaling_summary.to_dataframe().sort_values(
         _get_sort_by_column_names()).reset_index(drop=True)
+    hparam_summary = hparams.to_dataframe().sort_values(
+        _get_sort_by_column_names()).reset_index(drop=True)
     if len(weak_scaling_summary) > 0:
         weak_scaling_summary = weak_scaling_summary.to_dataframe().sort_values(
             _get_sort_by_column_names()).reset_index(drop=True)
-    return strong_scaling_summary, weak_scaling_summary
+    return strong_scaling_summary, weak_scaling_summary, hparam_summary
 
 
 def get_parser():
@@ -622,14 +724,16 @@ def main():
 
     strong_scaling_summaries = []
     weak_scaling_summaries = []
+    hparam_summaries = []
 
     def _update_summaries(folder):
-        strong_scaling_summary, weak_scaling_summary = summarize_results(
+        strong_scaling_summary, weak_scaling_summary, hparam_summary = summarize_results(
             folder,
             args.usage,
             args.ruleset,
         )
         strong_scaling_summaries.append(strong_scaling_summary)
+        hparam_summaries.append(hparam_summary)
         if len(weak_scaling_summary) > 0:
             weak_scaling_summaries.append(weak_scaling_summary)
 
@@ -656,18 +760,21 @@ def main():
         _update_summaries(args.folder)
 
     # Print and write back results.
-    def _print_and_write(summaries, weak_scaling=False, mode='w'):
+    def _print_and_write(summaries, weak_scaling=False, mode='w', is_hparams=False):
         if len(summaries) > 0:
             summaries = pd.concat(summaries).astype(
                 _get_column_schema(
                     args.usage,
                     args.ruleset,
                     weak_scaling=weak_scaling,
+                    is_hparams=is_hparams
                 ))
             if weak_scaling:
-                print('Weak Scaling Scores:')
+                print('\nWeak Scaling Scores:')
+            elif not is_hparams:
+                print('\nStrong Scaling Scores:')
             else:
-                print('Strong Scaling Scores:')
+                print('\nHPARAMS:')
             print(summaries)
             if args.csv is not None:
                 summaries.to_csv(args.csv, index=False, mode=mode)
@@ -676,6 +783,7 @@ def main():
                            None, 'display.max_colwidth', None):
         _print_and_write(strong_scaling_summaries)
         _print_and_write(weak_scaling_summaries, weak_scaling=True, mode='a')
+        _print_and_write(hparam_summaries, is_hparams=True, mode='a')
 
 
 if __name__ == '__main__':
